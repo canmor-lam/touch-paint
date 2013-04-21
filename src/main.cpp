@@ -1,4 +1,5 @@
 #include <X11/Xlib.h>
+#include <X11/Xatom.h>
 #include <X11/Xutil.h>
 #include <TWMTClient.h>
 
@@ -12,6 +13,7 @@ Display* the_display = NULL;
 Window the_main_window;
 GC the_main_gc;
 XColor the_colors[32];
+bool the_touch_is_idle = true;
 pthread_mutex_t the_mutex; 
 size_t the_drawing_size = 1;
 enum WorkingMode {
@@ -19,6 +21,13 @@ enum WorkingMode {
     Line,
     Dot,
 } the_working_mode;
+
+#define XA_TOUCH ((Atom) XA_LAST_PREDEFINED + 1)
+typedef enum {
+    TOUCH_UP,
+    TOUCH_DOWN,
+    TOUCH_DELTA
+} touch_phase_t;
 
 template <typename T>
 class Point : public std::complex<T>
@@ -70,14 +79,15 @@ public:
     size_t id() const { return _id; };
     void draw(Window win, GC gc, bool from_scratch)
     {
-        if (_step >= _loci.size())
+        if (!from_scratch && _step >= _loci.size())
             return;
 
         XWindowAttributes win_attributes = { 0 };
         XGetWindowAttributes(the_display, win, &win_attributes);
         std::vector<XPoint> xpoints;
         typedef std::vector< Point<double> >::const_iterator const_iterator; 
-        for (const_iterator it = (!from_scratch && _step > 0) ? _loci.begin() + _step - 1 : _loci.begin(); it != _loci.end(); ++it) {
+        const_iterator first = (!from_scratch && _step > 0) ? _loci.begin() + _step - 1 : _loci.begin();
+        for (const_iterator it = first; it != _loci.end(); ++it) {
             XPoint xpoint = { it->x() * win_attributes.width, it->y() * win_attributes.height };
             xpoints.push_back(xpoint);
         }
@@ -128,11 +138,11 @@ typedef struct xinput2_spec {
 
 xinput2_spec_t the_xinput2_spec = { 0 };
 
-std::vector<Brush> the_brushes;
+std::vector<Brush> the_drawing_brushes;
+std::vector<Brush> the_finished_brushes;
 
 void on_touch_message(char* message)
 {
-    pthread_mutex_lock(&the_mutex);
     char value[256] = { 0 };
     TouchWinSDK::GetValue(message, const_cast<char*>("id"), value);
     size_t id = static_cast<size_t>(-1);
@@ -144,35 +154,72 @@ void on_touch_message(char* message)
     TouchWinSDK::GetValue(message, const_cast<char*>("y"), value);
     std::stringstream(value) >> y;
     TouchWinSDK::GetValue(message, const_cast<char*>("GestureType"), value);
-    std::string phase(value);
+    std::string type(value);
     Brush brush(id, Point<double>(x, y));
-    if (phase == "GestureUp") {
-        std::vector<Brush>::iterator it = std::find(the_brushes.begin(), the_brushes.end(), brush);
-        if (it != the_brushes.end())
-            the_brushes.erase(it);
+    touch_phase_t phase;
+    if (type == "GestureUp") {
+        phase = TOUCH_UP;
     }
-    else if (phase == "GestureUpdate") {
-        for (std::vector<Brush>::iterator it = the_brushes.begin(); it != the_brushes.end(); ++it) {
+    else if (type == "GestureUpdate") {
+        phase = TOUCH_DELTA;
+    }
+    else if (type == "GestureDown") {
+        phase = TOUCH_DOWN;
+    }
+
+    XClientMessageEvent xevent; 
+    xevent.type = ClientMessage; 
+    xevent.message_type = XA_TOUCH; 
+    xevent.format = 32;
+    xevent.data.l[0] = id; 
+    xevent.data.l[1] = phase; 
+    xevent.data.l[2] = static_cast<long>(x * 0xffff); 
+    xevent.data.l[3] = static_cast<long>(y * 0xffff); 
+    //pthread_mutex_lock(&the_mutex);
+    //XLockDisplay(the_display);
+    XSendEvent(the_display, the_main_window, False, 0, (XEvent*)&xevent);
+    //XUnlockDisplay(the_display); 
+    //pthread_mutex_unlock(&the_mutex);
+};
+
+bool on_touch(XClientMessageEvent* xevent)
+{
+    size_t id = xevent->data.l[0];
+    double x = xevent->data.l[2] / static_cast<double>(0xffff);
+    double y = xevent->data.l[3] / static_cast<double>(0xffff);
+    Brush brush(id, Point<double>(x, y));
+    touch_phase_t phase = static_cast<touch_phase_t>(xevent->data.l[1]);
+    if (phase == TOUCH_UP) {
+        std::vector<Brush>::iterator it = std::find(the_drawing_brushes.begin(), the_drawing_brushes.end(), brush);
+        if (it != the_drawing_brushes.end()) {
+            the_finished_brushes.push_back(*it);
+            the_drawing_brushes.erase(it);
+        }
+    }
+    else if (phase == TOUCH_DELTA) {
+        for (std::vector<Brush>::iterator it = the_drawing_brushes.begin(); it != the_drawing_brushes.end(); ++it) {
             if (*it == brush) {
                 *it += brush;
                 break;
             }
         }
     }
-    else if (phase == "GestureDown") {
-        if (the_brushes.empty() && the_working_mode != Draw)
+    else if (phase == TOUCH_DOWN) {
+        if (the_drawing_brushes.empty() && the_working_mode != Draw) {
+            std::vector<Brush> empty;
+            std::swap(the_finished_brushes, empty);
             XClearArea(the_display, the_main_window, 0, 0, 0, 0, true);
-        the_brushes.push_back(brush);
+        }
+        the_drawing_brushes.push_back(brush);
     }
-    XLockDisplay(the_display);
+    the_touch_is_idle = the_drawing_brushes.empty();
     XEvent event = { 0 };
     event.type = Expose;
     event.xexpose.window = the_main_window;
     XSendEvent(the_display, the_main_window, False, ExposureMask, &event);
     XFlush(the_display);
-    XUnlockDisplay(the_display);
-    pthread_mutex_unlock(&the_mutex);
-};
+    return true;
+}
 
 void on_map_notify(XEvent* event)
 {
@@ -186,8 +233,14 @@ void on_expose(XEvent* event)
     if (event->xexpose.count > 0)
         return;
 
-    for (std::vector<Brush>::iterator it = the_brushes.begin(); it != the_brushes.end(); ++it) {
-        it->draw(event->xexpose.window, the_main_gc, false);
+    bool from_scratch = !event->xexpose.send_event;
+    if (from_scratch) {
+        for (std::vector<Brush>::iterator it = the_finished_brushes.begin(); it != the_finished_brushes.end(); ++it) {
+            it->draw(event->xexpose.window, the_main_gc, from_scratch);
+        }
+    }
+    for (std::vector<Brush>::iterator it = the_drawing_brushes.begin(); it != the_drawing_brushes.end(); ++it) {
+        it->draw(event->xexpose.window, the_main_gc, from_scratch);
     }
 }
 
@@ -213,10 +266,10 @@ bool on_key_release(XEvent* event)
         if (the_drawing_size > 1)
             --the_drawing_size;
     }
-    else if (key == XK_space)
-    {
-        std::vector<Brush> empty;
-        std::swap(the_brushes, empty);
+    else if (key == XK_space) {
+        std::vector<Brush> empty[2];
+        std::swap(the_drawing_brushes, empty[0]);
+        std::swap(the_finished_brushes, empty[1]);
         XClearArea(the_display, the_main_window, 0, 0, 0, 0, true);
     }
     return true;
@@ -235,8 +288,7 @@ void on_generic_event(XEvent* event)
 }
 
 bool on_event(Window win, XEvent* event)
-{
-
+{ 
     switch (event->type) {
     case MapNotify:
         on_map_notify(event);
@@ -265,7 +317,10 @@ bool on_event(Window win, XEvent* event)
         on_generic_event(event);
         break;
     case ClientMessage:
-        return false;
+        if (reinterpret_cast<XClientMessageEvent*>(event)->message_type == XA_TOUCH)
+            return on_touch(reinterpret_cast<XClientMessageEvent*>(event));
+        else
+            return false;
     default:
         break;
     } 
@@ -336,17 +391,23 @@ int main(int argc, char* argv[])
     XEvent event = { 0 };
     bool continued = true;
     while (continued) {
-        pthread_mutex_lock(&the_mutex);
-        XLockDisplay(the_display);
+        //pthread_mutex_lock(&the_mutex);
+        //XLockDisplay(the_display);
         if (XPending(the_display) <= 0) {
-            XUnlockDisplay(the_display);
-            pthread_mutex_unlock(&the_mutex);
-            usleep(5000);
+            //XUnlockDisplay(the_display);
+            //pthread_mutex_unlock(&the_mutex);
+
+            /* take a longer sleep (10ms) to save cpus while there is no any touch,
+             * or just give up this cpu slot for performance. */
+            if (the_touch_is_idle)
+                usleep(10000);
+            else
+                sched_yield();
             continue;
         } 
         continued = XNextEvent(the_display, &event) >= 0 && on_event(the_main_window, &event);
-        XUnlockDisplay(the_display);
-        pthread_mutex_unlock(&the_mutex);
+        //XUnlockDisplay(the_display);
+        //pthread_mutex_unlock(&the_mutex);
     }
 
     pthread_mutex_destroy(&the_mutex);
