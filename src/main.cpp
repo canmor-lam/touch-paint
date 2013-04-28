@@ -1,6 +1,8 @@
 #include <X11/Xlib.h>
 #include <X11/Xatom.h>
 #include <X11/Xutil.h>
+#include <X11/extensions/XInput.h>
+#include <X11/extensions/XInput2.h>
 #include <TWMTClient.h>
 
 #include <iostream>
@@ -14,7 +16,6 @@ Window the_main_window;
 GC the_main_gc;
 XColor the_colors[32];
 bool the_touch_is_idle = true;
-pthread_mutex_t the_mutex; 
 size_t the_drawing_size = 1;
 enum WorkingMode {
     Draw,
@@ -134,6 +135,7 @@ typedef struct xinput2_spec {
     int opcode;
     int event_base;
     int error_base;
+    bool is_touch_supported;
 } xinput2_spec_t;
 
 xinput2_spec_t the_xinput2_spec = { 0 };
@@ -141,7 +143,20 @@ xinput2_spec_t the_xinput2_spec = { 0 };
 std::vector<Brush> the_drawing_brushes;
 std::vector<Brush> the_finished_brushes;
 
-void on_touch_message(char* message)
+static void send_touch_event(size_t id, touch_phase_t phase, long x, long y)
+{
+    XClientMessageEvent xevent; 
+    xevent.type = ClientMessage; 
+    xevent.message_type = XA_TOUCH; 
+    xevent.format = 32;
+    xevent.data.l[0] = id; 
+    xevent.data.l[1] = phase; 
+    xevent.data.l[2] = x; 
+    xevent.data.l[3] = y; 
+    XSendEvent(the_display, the_main_window, False, 0, (XEvent*)&xevent);
+}
+
+static void on_touch_message(char* message)
 {
     char value[256] = { 0 };
     TouchWinSDK::GetValue(message, const_cast<char*>("id"), value);
@@ -166,27 +181,23 @@ void on_touch_message(char* message)
     else if (type == "GestureDown") {
         phase = TOUCH_DOWN;
     }
+    else
+        return;
 
-    XClientMessageEvent xevent; 
-    xevent.type = ClientMessage; 
-    xevent.message_type = XA_TOUCH; 
-    xevent.format = 32;
-    xevent.data.l[0] = id; 
-    xevent.data.l[1] = phase; 
-    xevent.data.l[2] = static_cast<long>(x * 0xffff); 
-    xevent.data.l[3] = static_cast<long>(y * 0xffff); 
-    //pthread_mutex_lock(&the_mutex);
-    //XLockDisplay(the_display);
-    XSendEvent(the_display, the_main_window, False, 0, (XEvent*)&xevent);
-    //XUnlockDisplay(the_display); 
-    //pthread_mutex_unlock(&the_mutex);
+    int screen = DefaultScreen(the_display);
+    const int width = DisplayWidth(the_display, screen);
+    const int height = DisplayHeight(the_display, screen); 
+    send_touch_event(id, phase, static_cast<long>(x * width), static_cast<long>(y * height));
 };
 
-bool on_touch(XClientMessageEvent* xevent)
+static bool on_touch(XClientMessageEvent* xevent)
 {
+    int screen = DefaultScreen(the_display);
+    const int width = DisplayWidth(the_display, screen);
+    const int height = DisplayHeight(the_display, screen); 
     size_t id = xevent->data.l[0];
-    double x = xevent->data.l[2] / static_cast<double>(0xffff);
-    double y = xevent->data.l[3] / static_cast<double>(0xffff);
+    double x = xevent->data.l[2] / static_cast<double>(width);
+    double y = xevent->data.l[3] / static_cast<double>(height);
     Brush brush(id, Point<double>(x, y));
     touch_phase_t phase = static_cast<touch_phase_t>(xevent->data.l[1]);
     if (phase == TOUCH_UP) {
@@ -221,14 +232,17 @@ bool on_touch(XClientMessageEvent* xevent)
     return true;
 }
 
-void on_map_notify(XEvent* event)
+static void on_map_notify(XEvent* event)
 {
-    TouchWinSDK::SetCallBackFunc(on_touch_message);
-    TouchWinSDK::InitGestureServer();
-    TouchWinSDK::ConnectServer();
+    if (!the_xinput2_spec.is_touch_supported) {
+        std::cout << "xinput is not support for touch, use touchwin-sdk instead of" << std::endl;
+        TouchWinSDK::SetCallBackFunc(on_touch_message);
+        TouchWinSDK::InitGestureServer();
+        TouchWinSDK::ConnectServer();
+    }
 }
 
-void on_expose(XEvent* event)
+static void on_expose(XEvent* event)
 {
     if (event->xexpose.count > 0)
         return;
@@ -244,7 +258,7 @@ void on_expose(XEvent* event)
     }
 }
 
-bool on_key_release(XEvent* event)
+static bool on_key_release(XEvent* event)
 {
     int key = XLookupKeysym(&event->xkey, 0);
     if (key == XK_Escape) {
@@ -275,20 +289,46 @@ bool on_key_release(XEvent* event)
     return true;
 }
 
-void on_generic_event(XEvent* event)
+static bool on_xi_event(XIDeviceEvent* xievent)
 {
-    bool isXI2Event = false;
-    XGenericEventCookie xcookie = { 0 };
+    const int id = xievent->detail;
+    const int x = xievent->event_x;
+    const int y = xievent->event_y;
+    touch_phase_t phase;
 
-    if (XGetEventData(the_display, &xcookie)
-        && event->xcookie.extension == the_xinput2_spec.opcode) {
-        // remember for later
-        isXI2Event = true;
-    }
+    switch (xievent->evtype) {
+    case XI_TouchBegin:
+        phase = TOUCH_DOWN;
+        break;
+    case XI_TouchUpdate:
+        phase = TOUCH_DELTA;
+        break;
+    case XI_TouchEnd:
+        phase = TOUCH_UP;
+        break;
+    default:
+        return true;
+    } 
+    send_touch_event(id, phase, x, y);
+    return true;
 }
 
-bool on_event(Window win, XEvent* event)
+static bool on_generic_event(XGenericEventCookie* xcookie)
+{
+    if (xcookie->extension == the_xinput2_spec.opcode) {
+        return on_xi_event((XIDeviceEvent*)xcookie->data);
+    }
+    return true;
+}
+
+static bool on_event(Window win, XEvent* event)
 { 
+    XGenericEventCookie *cookie = &event->xcookie;
+    if (XGetEventData(the_display, cookie) && cookie->type == GenericEvent) {
+        return on_generic_event(cookie);
+    }
+    XFreeEventData(the_display, cookie); 
+
     switch (event->type) {
     case MapNotify:
         on_map_notify(event);
@@ -313,9 +353,6 @@ bool on_event(Window win, XEvent* event)
         break;
     case SelectionClear:
         break;
-    case GenericEvent:
-        on_generic_event(event);
-        break;
     case ClientMessage:
         if (reinterpret_cast<XClientMessageEvent*>(event)->message_type == XA_TOUCH)
             return on_touch(reinterpret_cast<XClientMessageEvent*>(event));
@@ -327,10 +364,10 @@ bool on_event(Window win, XEvent* event)
     return true;
 };
 
-void set_fullscreen(Display* display, Window window)
+static void set_fullscreen(Display* display, Window window)
 {
-    Atom wm_state = XInternAtom(the_display, "_NET_WM_STATE", False);
-    Atom fullscreen = XInternAtom(the_display, "_NET_WM_STATE_FULLSCREEN", False);
+    Atom wm_state = XInternAtom(display, "_NET_WM_STATE", False);
+    Atom fullscreen = XInternAtom(display, "_NET_WM_STATE_FULLSCREEN", False);
     XEvent event = { 0 };
     event.type = ClientMessage;
     event.xclient.window = the_main_window;
@@ -339,64 +376,104 @@ void set_fullscreen(Display* display, Window window)
     event.xclient.data.l[0] = 1;
     event.xclient.data.l[1] = fullscreen;
     event.xclient.data.l[2] = 0;
-    XSendEvent(the_display, DefaultRootWindow(the_display), False, SubstructureNotifyMask, &event);
+    XSendEvent(display, DefaultRootWindow(display), False, SubstructureNotifyMask, &event);
 };
 
-int main(int argc, char* argv[])
+static void regiester_touch_window(Display* display, Window window)
 {
-    pthread_mutex_init(&the_mutex, NULL);
-    XInitThreads();
+    XIEventMask eventmask;
+    unsigned char mask[1] = { 0 };
+    eventmask.deviceid = 2;
+    eventmask.mask_len = sizeof(mask);
+    XISetMask(mask, XI_TouchBegin);
+    XISetMask(mask, XI_TouchUpdate);
+    XISetMask(mask, XI_TouchEnd);
+    XISelectEvents(display, window, &eventmask, 1);
 
-    the_display = XOpenDisplay(NULL);
 
-    int screen = DefaultScreen(the_display);
-    int width = DisplayWidth(the_display, screen);
-    int height = DisplayHeight(the_display, screen); 
-    int black_pixel = BlackPixel(the_display, screen);
-    int white_pixel = WhitePixel(the_display, screen);
+    if (the_xinput2_spec.is_enabled) {
+        XIEventMask xieventmask;
 
-    the_xinput2_spec.is_enabled = XQueryExtension(the_display, "XInputExtension",
+        const int mask_len = XIMaskLen(XI_LASTEVENT);
+        unsigned char* bitmask = (unsigned char*) calloc(mask_len, sizeof(unsigned char));
+
+        xieventmask.deviceid = XIAllMasterDevices;
+        xieventmask.mask = bitmask;
+        xieventmask.mask_len = mask_len;
+
+        XISetMask(bitmask, XI_TouchBegin);
+        XISetMask(bitmask, XI_TouchEnd);
+        XISetMask(bitmask, XI_TouchUpdate);
+
+        XISelectEvents(display, window, &xieventmask, 1);
+        free(bitmask);
+    }
+}
+
+static void initialize_xinput(Display* display)
+{
+    the_xinput2_spec.is_enabled = XQueryExtension(display, "XInputExtension",
         &the_xinput2_spec.opcode, &the_xinput2_spec.event_base, &the_xinput2_spec.error_base);
-    std::cout << "with XInput 2 support: "
-        << (the_xinput2_spec.is_enabled ? "true" : "false") << std::endl;
+    int ximajor = 2, ximinor = 2;
+    the_xinput2_spec.is_touch_supported = (XIQueryVersion(display, &ximajor, &ximinor) == Success);
+    std::cout << "with XInput 2 support: " << (the_xinput2_spec.is_enabled ? "YES" : "NO") << std::endl;
+    std::cout << "with touch support: " << (the_xinput2_spec.is_touch_supported ? "YES" : "NO") << std::endl;
+}
 
-    Window root = DefaultRootWindow(the_display);
-    the_main_window = XCreateSimpleWindow(the_display, root,
-        0, 0, width >> 1, height >> 1,
-        3, black_pixel, white_pixel);
-
-    long event_mask =
-        KeymapStateMask | EnterWindowMask | LeaveWindowMask | PropertyChangeMask
-        | PointerMotionMask | PointerMotionHintMask | Button1MotionMask
-        | KeyPressMask | KeyReleaseMask
-        | ButtonPressMask | StructureNotifyMask | ExposureMask;
-    XSelectInput(the_display, the_main_window, event_mask);
-
-    XMapWindow(the_display, the_main_window);
-
-    the_main_gc = XCreateGC(the_display, the_main_window, 0, NULL); 
-
-    Colormap colormap = DefaultColormap(the_display, DefaultScreen(the_display));
+static void initialize_colors(Display* display)
+{
+    Colormap colormap = DefaultColormap(display, DefaultScreen(display));
     for (size_t i = 0; i < 32; ++i) {
         XColor color;
         color.red = rand() % 0xffff;
         color.green = rand() % 0xffff;
         color.blue = rand() % 0xffff;
-        Status rc = XAllocColor(the_display, colormap, &color);
+        Status rc = XAllocColor(display, colormap, &color);
         the_colors[i] = color;
     }
+}
 
-    set_fullscreen(the_display, the_main_window);
+static Window create_main_window(Display* display)
+{
+    Window root = DefaultRootWindow(the_display);
+    int screen = DefaultScreen(the_display);
+    int width = DisplayWidth(the_display, screen);
+    int height = DisplayHeight(the_display, screen); 
+    int black_pixel = BlackPixel(the_display, screen);
+    int white_pixel = WhitePixel(the_display, screen); 
+    return XCreateSimpleWindow(the_display, root,
+        0, 0, width >> 1, height >> 1,
+        3, black_pixel, white_pixel);
+}
+
+static void select_event(Display* display, Window window)
+{
+    long event_mask =
+        KeymapStateMask | EnterWindowMask | LeaveWindowMask | PropertyChangeMask
+        | PointerMotionMask | PointerMotionHintMask | Button1MotionMask
+        | KeyPressMask | KeyReleaseMask
+        | ButtonPressMask | StructureNotifyMask | ExposureMask;
+    XSelectInput(display, window, event_mask);
+}
+
+int main(int argc, char* argv[])
+{
+    XInitThreads();
+
+    the_display = XOpenDisplay(NULL); 
+    initialize_xinput(the_display); 
+    initialize_colors(the_display); 
+    the_main_window = create_main_window(the_display); 
+    select_event(the_display, the_main_window); 
+    regiester_touch_window(the_display, the_main_window); 
+    XMapWindow(the_display, the_main_window); 
+    set_fullscreen(the_display, the_main_window); 
+    the_main_gc = XCreateGC(the_display, the_main_window, 0, NULL); 
 
     XEvent event = { 0 };
     bool continued = true;
     while (continued) {
-        //pthread_mutex_lock(&the_mutex);
-        //XLockDisplay(the_display);
         if (XPending(the_display) <= 0) {
-            //XUnlockDisplay(the_display);
-            //pthread_mutex_unlock(&the_mutex);
-
             /* take a longer sleep (10ms) to save cpus while there is no any touch,
              * or just give up this cpu slot for performance. */
             if (the_touch_is_idle)
@@ -405,12 +482,9 @@ int main(int argc, char* argv[])
                 sched_yield();
             continue;
         } 
-        continued = XNextEvent(the_display, &event) >= 0 && on_event(the_main_window, &event);
-        //XUnlockDisplay(the_display);
-        //pthread_mutex_unlock(&the_mutex);
+        continued = XNextEvent(the_display, &event) >= 0 && on_event(the_main_window, &event); 
     }
 
-    pthread_mutex_destroy(&the_mutex);
     XFreeGC(the_display, the_main_gc);
     XDestroyWindow(the_display, the_main_window);
     XCloseDisplay(the_display);
