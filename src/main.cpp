@@ -3,7 +3,6 @@
 #include <X11/Xutil.h>
 #include <X11/extensions/XInput.h>
 #include <X11/extensions/XInput2.h>
-#include <TWMTClient.h>
 
 #include <iostream>
 #include <unistd.h> 
@@ -156,40 +155,6 @@ static void send_touch_event(size_t id, touch_phase_t phase, long x, long y)
     XSendEvent(the_display, the_main_window, False, 0, (XEvent*)&xevent);
 }
 
-static void on_touch_message(char* message)
-{
-    char value[256] = { 0 };
-    TouchWinSDK::GetValue(message, const_cast<char*>("id"), value);
-    size_t id = static_cast<size_t>(-1);
-    std::stringstream(value) >> id;
-    double x = 0;
-    TouchWinSDK::GetValue(message, const_cast<char*>("x"), value);
-    std::stringstream(value) >> x;
-    double y = 0;
-    TouchWinSDK::GetValue(message, const_cast<char*>("y"), value);
-    std::stringstream(value) >> y;
-    TouchWinSDK::GetValue(message, const_cast<char*>("GestureType"), value);
-    std::string type(value);
-    Brush brush(id, Point<double>(x, y));
-    touch_phase_t phase;
-    if (type == "GestureUp") {
-        phase = TOUCH_UP;
-    }
-    else if (type == "GestureUpdate") {
-        phase = TOUCH_DELTA;
-    }
-    else if (type == "GestureDown") {
-        phase = TOUCH_DOWN;
-    }
-    else
-        return;
-
-    int screen = DefaultScreen(the_display);
-    const int width = DisplayWidth(the_display, screen);
-    const int height = DisplayHeight(the_display, screen); 
-    send_touch_event(id, phase, static_cast<long>(x * width), static_cast<long>(y * height));
-};
-
 static bool on_touch(XClientMessageEvent* xevent)
 {
     int screen = DefaultScreen(the_display);
@@ -236,9 +201,6 @@ static void on_map_notify(XEvent* event)
 {
     if (!the_xinput2_spec.is_touch_supported) {
         std::cout << "xinput is not support for touch, use touchwin-sdk instead of" << std::endl;
-        TouchWinSDK::SetCallBackFunc(on_touch_message);
-        TouchWinSDK::InitGestureServer();
-        TouchWinSDK::ConnectServer();
     }
 }
 
