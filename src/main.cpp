@@ -343,16 +343,6 @@ static void set_fullscreen(Display* display, Window window)
 
 static void regiester_touch_window(Display* display, Window window)
 {
-    XIEventMask eventmask;
-    unsigned char mask[1] = { 0 };
-    eventmask.deviceid = 2;
-    eventmask.mask_len = sizeof(mask);
-    XISetMask(mask, XI_TouchBegin);
-    XISetMask(mask, XI_TouchUpdate);
-    XISetMask(mask, XI_TouchEnd);
-    XISelectEvents(display, window, &eventmask, 1);
-
-
     if (the_xinput2_spec.is_enabled) {
         XIEventMask xieventmask;
 
